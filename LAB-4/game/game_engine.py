@@ -1,6 +1,46 @@
-import math
 import random
+import time
 import pygame
+
+# ---------------------------------------------------------------------------
+# Coordinate convention: arm_position < 0 is the PLAYER's side,
+# arm_position > 0 is the COMPUTER's side.
+#   player wins at  -TARGET_LIMIT   (-100.0)
+#   computer wins at +TARGET_LIMIT  (+100.0)
+# ---------------------------------------------------------------------------
+TARGET_LIMIT = 100.0
+
+# --- Player ---------------------------------------------------------------
+PLAYER_PUSH_STRENGTH = 4.2          # arm units moved per valid key press
+PLAYER_PUSH_STAMINA_COST = 2.0      # stamina spent per valid key press
+MAX_STAMINA = 100.0
+STAMINA_RECOVERY_PER_SEC = 15.0     # natural recovery (units / second)
+EXHAUSTION_THRESHOLD = 10.0         # stamina below this -> exhausted
+EXHAUSTION_RECOVER_THRESHOLD = 25.0 # stamina needed to push again
+
+# --- AI -------------------------------------------------------------------
+AI_BASE_FORCE_PER_SEC = 21.0        # baseline push (units / second), before variance
+AI_VARIANCE_MIN = 0.3
+AI_VARIANCE_MAX = 1.0
+AI_NORMAL_DURATION = 4.0            # seconds of normal resistance
+AI_SURGE_DURATION = 2.0             # seconds of high-power surge
+AI_COOLDOWN_DURATION = 3.0          # seconds of reduced resistance
+AI_SURGE_MULTIPLIER = 1.8           # force multiplier during surge (> 1)
+AI_COOLDOWN_MULTIPLIER = 0.35       # force multiplier during cooldown (< 1)
+
+# --- Counter-surge bonus --------------------------------------------------
+COUNTER_SURGE_WINDOW = 0.6          # seconds after surge->cooldown to trigger
+COUNTER_SURGE_DURATION = 4.0        # seconds the bonus stays active
+COUNTER_SURGE_PUSH_MULTIPLIER = 2.0
+COUNTER_SURGE_RECOVERY_MULTIPLIER = 3.0
+
+# --- Misc -----------------------------------------------------------------
+MAX_FRAME_DT = 0.05                 # clamp dt so a stall can't skip phases
+
+# AI phases
+AI_NORMAL = "NORMAL"
+AI_SURGE = "SURGE"
+AI_COOLDOWN = "COOLDOWN"
 
 
 class GameEngine:
@@ -8,66 +48,160 @@ class GameEngine:
     def __init__(self, width, height):
         self.width = width
         self.height = height
-        
-        self.arm_position = 0.0
-        self.target_limit = 100.0
-        self.last_key = None
-        
-        self.stamina = 100.0
-        self.max_stamina = 100.0
-        
-        self.winner = None
-        self.game_state = "PLAYING"
-        self.ai_strength = 0.35  
-        
+
+        self.target_limit = TARGET_LIMIT
+        self.max_stamina = MAX_STAMINA
+        self.ai_strength = AI_BASE_FORCE_PER_SEC
+
         self.font_big = pygame.font.SysFont(None, 44)
         self.font_med = pygame.font.SysFont(None, 26)
 
+        self._last_tick = None
+        self.reset()
+
+    # ------------------------------------------------------------------ state
+    def reset(self):
+        """Reset every piece of round-specific state."""
+        self.arm_position = 0.0
+        self.last_key = None
+
+        self.stamina = self.max_stamina
+        self.exhausted = False
+
+        self.winner = None
+        self.game_state = "PLAYING"
+
+        self.ai_state = AI_NORMAL
+        self.ai_phase_time = 0.0        # seconds spent in current AI phase
+
+        self.counter_window_time = 0.0  # remaining time of the counter window
+        self.counter_bonus_time = 0.0   # remaining time of the active bonus
+
+        self._last_tick = None          # avoid a huge dt after a pause/rematch
+
+    # ------------------------------------------------------------------ input
     def handle_event(self, event):
         if self.game_state != "PLAYING":
             if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
                 self.reset()
             return
 
-        if event.type == pygame.KEYDOWN:
-            if self.stamina <= 10:
-                return
-                
-            if event.key == pygame.K_LEFT:
-                if self.last_key != pygame.K_LEFT: 
-                    self.arm_position += 4.2
-                    self.stamina = max(0.0, self.stamina - 2.0)
-                    self.last_key = pygame.K_LEFT
-            elif event.key == pygame.K_RIGHT:
-                if self.last_key != pygame.K_RIGHT: 
-                    self.arm_position += 4.2
-                    self.stamina = max(0.0, self.stamina - 2.0)
-                    self.last_key = pygame.K_RIGHT
-
-    def update(self):
-        if self.game_state != "PLAYING":
+        if event.type != pygame.KEYDOWN:
+            return
+        if event.key not in (pygame.K_LEFT, pygame.K_RIGHT):
+            return
+        # Ignore auto-repeat style duplicates: a key must differ from the last.
+        if event.key == self.last_key:
+            return
+        # Exhausted players cannot push (and the press is not remembered).
+        if self.exhausted or self.stamina < EXHAUSTION_THRESHOLD:
+            self.exhausted = True
             return
 
-        ai_variance = random.uniform(0.3, 1.0)
-        self.arm_position += self.ai_strength * ai_variance
+        self.last_key = event.key
 
-        if self.stamina < self.max_stamina:
-            self.stamina = min(self.max_stamina, self.stamina + 0.8)
+        # Counter-surge: valid push inside the window right after surge ends.
+        if self.counter_window_time > 0.0 and self.counter_bonus_time <= 0.0:
+            self.counter_bonus_time = COUNTER_SURGE_DURATION
+            self.counter_window_time = 0.0   # one activation per transition
 
+        strength = PLAYER_PUSH_STRENGTH
+        if self.counter_bonus_time > 0.0:
+            strength *= COUNTER_SURGE_PUSH_MULTIPLIER
+
+        # Player pushes toward the NEGATIVE (player) side.
+        self.arm_position -= strength
+        self.stamina = max(0.0, self.stamina - PLAYER_PUSH_STAMINA_COST)
+        if self.stamina < EXHAUSTION_THRESHOLD:
+            self.exhausted = True
+
+        self._clamp_and_check_winner()
+
+    # ----------------------------------------------------------------- update
+    def update(self, dt=None):
+        if self.game_state != "PLAYING":
+            self._last_tick = None
+            return
+
+        if dt is None:
+            now = time.perf_counter()
+            dt = 0.0 if self._last_tick is None else now - self._last_tick
+            self._last_tick = now
+        dt = max(0.0, min(dt, MAX_FRAME_DT))
+
+        self._update_ai_cycle(dt)
+        self._update_counter_timers(dt)
+
+        # AI force (uses existing strength + random variance), scaled by phase.
+        ai_variance = random.uniform(AI_VARIANCE_MIN, AI_VARIANCE_MAX)
+        self.arm_position += (
+            self.ai_strength * ai_variance * self._ai_multiplier() * dt
+        )
+
+        # Stamina recovery (faster during the counter-surge bonus).
+        recovery = STAMINA_RECOVERY_PER_SEC
+        if self.counter_bonus_time > 0.0:
+            recovery *= COUNTER_SURGE_RECOVERY_MULTIPLIER
+        self.stamina = min(self.max_stamina, self.stamina + recovery * dt)
+
+        if self.exhausted and self.stamina >= EXHAUSTION_RECOVER_THRESHOLD:
+            self.exhausted = False
+
+        self._clamp_and_check_winner()
+
+    def _ai_multiplier(self):
+        if self.ai_state == AI_SURGE:
+            return AI_SURGE_MULTIPLIER
+        if self.ai_state == AI_COOLDOWN:
+            return AI_COOLDOWN_MULTIPLIER
+        return 1.0
+
+    def _ai_phase_duration(self):
+        return {
+            AI_NORMAL: AI_NORMAL_DURATION,
+            AI_SURGE: AI_SURGE_DURATION,
+            AI_COOLDOWN: AI_COOLDOWN_DURATION,
+        }[self.ai_state]
+
+    def _update_ai_cycle(self, dt):
+        self.ai_phase_time += dt
+        # while-loop so a long dt still performs every transition in order
+        while self.ai_phase_time >= self._ai_phase_duration():
+            self.ai_phase_time -= self._ai_phase_duration()
+            if self.ai_state == AI_NORMAL:
+                self.ai_state = AI_SURGE
+            elif self.ai_state == AI_SURGE:
+                self.ai_state = AI_COOLDOWN
+                # Surge just ended: open the counter-surge timing window.
+                self.counter_window_time = COUNTER_SURGE_WINDOW
+            else:
+                self.ai_state = AI_NORMAL
+                self.counter_window_time = 0.0
+
+    def _update_counter_timers(self, dt):
+        if self.counter_window_time > 0.0:
+            self.counter_window_time = max(0.0, self.counter_window_time - dt)
+        if self.counter_bonus_time > 0.0:
+            self.counter_bonus_time = max(0.0, self.counter_bonus_time - dt)
+
+    def _clamp_and_check_winner(self):
+        if self.game_state != "PLAYING":
+            return
         if self.arm_position <= -self.target_limit:
+            self.arm_position = -self.target_limit
             self.winner = "PLAYER"
             self.game_state = "GAME_OVER"
         elif self.arm_position >= self.target_limit:
+            self.arm_position = self.target_limit
             self.winner = "COMPUTER"
             self.game_state = "GAME_OVER"
 
-    def reset(self):
-        self.arm_position = 0.0
-        self.stamina = 100.0
-        self.last_key = None
-        self.winner = None
-        self.game_state = "PLAYING"
+        if self.game_state == "GAME_OVER":
+            # Nothing temporary should linger on the post-game screen.
+            self.counter_window_time = 0.0
+            self.counter_bonus_time = 0.0
 
+    # ----------------------------------------------------------------- render
     def render(self, screen):
         screen.fill((25, 28, 35))
 
@@ -112,7 +246,11 @@ class GameEngine:
         stamina_fill = pygame.Rect(140, 448, int(240 * (self.stamina / self.max_stamina)), 22)
         pygame.draw.rect(screen, (45, 50, 60), stamina_bg, border_radius=6)
         bar_color = (60, 210, 100) if self.stamina > 25 else (220, 60, 60)
+        if self.counter_bonus_time > 0.0:
+            bar_color = (255, 210, 60)
         pygame.draw.rect(screen, bar_color, stamina_fill, border_radius=6)
+
+        self._render_indicators(screen)
 
         if self.game_state == "GAME_OVER":
             overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
@@ -134,3 +272,52 @@ class GameEngine:
                 restart_surf,
                 (self.width // 2 - restart_surf.get_width() // 2, self.height // 2 + 10)
             )
+
+    def _render_banner(self, screen, text, y, fg, bg):
+        surf = self.font_med.render(text, True, fg)
+        rect = pygame.Rect(0, 0, self.width - 80, 34)
+        rect.midtop = (self.width // 2, y)
+        pygame.draw.rect(screen, bg, rect, border_radius=8)
+        screen.blit(
+            surf,
+            (rect.centerx - surf.get_width() // 2, rect.centery - surf.get_height() // 2),
+        )
+
+    def _render_indicators(self, screen):
+        """AI-state, exhaustion and counter-surge indicators (below the bar)."""
+        if self.game_state != "PLAYING":
+            return
+
+        # AI state banner (always visible so states are clearly distinguished)
+        remaining = max(0.0, self._ai_phase_duration() - self.ai_phase_time)
+        if self.ai_state == AI_SURGE:
+            blink = int(self.ai_phase_time * 6) % 2 == 0
+            bg = (200, 30, 30) if blink else (140, 20, 20)
+            self._render_banner(
+                screen, f"!! WARNING: AI SURGE !!  {remaining:.1f}s", 490,
+                (255, 255, 255), bg)
+        elif self.ai_state == AI_COOLDOWN:
+            self._render_banner(
+                screen, f"AI COOLDOWN - weakened  {remaining:.1f}s", 490,
+                (255, 255, 255), (40, 100, 190))
+        else:
+            self._render_banner(
+                screen, "AI: normal resistance", 490,
+                (210, 210, 210), (50, 55, 65))
+
+        # Player exhaustion
+        if self.exhausted:
+            self._render_banner(
+                screen, "EXHAUSTED - recovering, cannot push!", 535,
+                (30, 20, 0), (255, 160, 30))
+        # Counter-surge bonus (or the 'push now!' prompt during the window)
+        elif self.counter_bonus_time > 0.0:
+            self._render_banner(
+                screen,
+                f"COUNTER-SURGE! x{COUNTER_SURGE_PUSH_MULTIPLIER:g} PUSH + FAST RECOVERY  "
+                f"{self.counter_bonus_time:.1f}s",
+                535, (40, 30, 0), (255, 210, 60))
+        elif self.counter_window_time > 0.0:
+            self._render_banner(
+                screen, "PUSH NOW for COUNTER-SURGE!", 535,
+                (255, 255, 255), (60, 160, 90))
